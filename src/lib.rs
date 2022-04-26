@@ -1,8 +1,10 @@
-use rppal::i2c::I2c;
-use std::thread::sleep;
-use std::time::Duration;
+use defmt::Format;
+use embedded_hal::blocking::{
+    delay::DelayMs,
+    i2c::{Read, Write},
+};
 
-const ADDR: u16 = 0x38;
+const ADDR: u8 = 0x38;
 const CMD_INIT: u8 = 0xE1;
 const INIT_ARG1: u8 = 0x08;
 const INIT_ARG2: u8 = 0x00;
@@ -11,122 +13,18 @@ const MEASURE_ARG1: u8 = 0x33;
 const MEASURE_ARG2: u8 = 0x00;
 const CMD_RESET: u8 = 0xBA;
 
-pub struct Aht100 {
-    i2c: I2c,
+pub struct Aht100<I2C> {
+    i2c: I2C,
 }
 
+#[derive(Format)]
 pub struct AhtData {
     pub temp: f32,
     pub hum: f32,
 }
 
-pub struct AhtStatus {
-    busy: bool,
-    mode: Mode,
-    cal: bool,
-}
-
-pub enum Mode {
-    Nor,
-    Cyc,
-    Cmd,
-}
-
-impl Aht100 {
-    pub fn new(mut i2c: I2c) -> Result<Self, ()> {
-        match i2c.set_slave_address(ADDR) {
-            Ok(_) => Ok(Self { i2c }),
-            Err(e) => {
-                println!("I2C set slave address failed. {}", e);
-                Err(())
-            }
-        }
-    }
-
-    pub fn reset(&mut self) -> Result<(), ()> {
-        match self.i2c.write(&[CMD_RESET]) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                println!("Write reset command failed. {}", e);
-                Err(())
-            }
-        }
-    }
-
-    pub fn init(&mut self) -> Result<AhtStatus, ()> {
-        sleep(Duration::from_millis(40));
-        match self.i2c.write(&[CMD_INIT, INIT_ARG1, INIT_ARG2]) {
-            Ok(_) => {
-                sleep(Duration::from_millis(75));
-                let mut buffer = [0; 6];
-                match self.i2c.read(&mut buffer) {
-                    Ok(len) if len > 0 => Ok(self.decode_status(buffer[0])),
-                    Err(e) => {
-                        println!("Read device status failed. {}", e);
-                        Err(())
-                    }
-                    _ => {
-                        println!("Read device status no response");
-                        Err(())
-                    }
-                }
-            }
-            Err(e) => {
-                println!("Write init command failed. {}", e);
-                Err(())
-            }
-        }
-    }
-
-    pub fn measure(&mut self) -> Result<AhtData, ()> {
-        match self.i2c.write(&[CMD_MEASURE, MEASURE_ARG1, MEASURE_ARG2]) {
-            Ok(_) => {
-                sleep(Duration::from_millis(75));
-                let mut buffer = [0; 6];
-                match self.i2c.read(&mut buffer) {
-                    Ok(len) if len == 6 => {
-                        let status = self.decode_status(buffer[0]);
-                        if status.busy {
-                            println!("Device is busy");
-                            return Err(());
-                        }
-                        if !status.cal {
-                            println!("Device is not calibration");
-                            return Err(());
-                        }
-                        Ok(self
-                            .decode_data([buffer[1], buffer[2], buffer[3], buffer[4], buffer[5]]))
-                    }
-                    Err(e) => {
-                        println!("Read device status failed. {}", e);
-                        Err(())
-                    }
-                    _ => {
-                        println!("Read device status no response");
-                        Err(())
-                    }
-                }
-            }
-            Err(e) => {
-                println!("Write measure command failed. {}", e);
-                Err(())
-            }
-        }
-    }
-
-    fn decode_status(&self, byte: u8) -> AhtStatus {
-        AhtStatus {
-            busy: byte > 0x7F,
-            mode: match byte & 0b01100000 {
-                0x00 => Mode::Nor,
-                0x20 => Mode::Cyc,
-                _ => Mode::Cmd,
-            },
-            cal: (byte & 0x08) == 0x08,
-        }
-    }
-
-    fn decode_data(&self, bytes: [u8; 5]) -> AhtData {
+impl AhtData {
+    pub fn from_bytes(bytes: [u8; 5]) -> Self {
         let hum = ((bytes[0] as u32) << 12) | ((bytes[1] as u32) << 4) | ((bytes[2] >> 4) as u32);
         let temp =
             (((bytes[2] << 4 >> 4) as u32) << 16) | ((bytes[3] as u32) << 8) | (bytes[4] as u32);
@@ -137,8 +35,89 @@ impl Aht100 {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {}
+pub struct AhtStatus {
+    pub busy: bool,
+    pub mode: Mode,
+    pub cal: bool,
+}
+
+impl AhtStatus {
+    fn from_byte(byte: u8) -> Self {
+        AhtStatus {
+            busy: byte > 0x7F,
+            mode: match byte & 0b01100000 {
+                0x00 => Mode::Nor,
+                0x20 => Mode::Cyc,
+                _ => Mode::Cmd,
+            },
+            cal: (byte & 0x08) == 0x08,
+        }
+    }
+}
+
+pub enum Mode {
+    Nor,
+    Cyc,
+    Cmd,
+}
+
+impl<I2C> Aht100<I2C>
+where
+    I2C: Read + Write,
+{
+    pub fn new(i2c: I2C) -> Self {
+        Self { i2c }
+    }
+
+    pub fn reset(&mut self) -> Result<(), ()> {
+        match self.i2c.write(ADDR, &[CMD_RESET]) {
+            Ok(_) => Ok(()),
+            Err(_e) => Err(()),
+        }
+    }
+
+    pub fn init(&mut self, delay: &mut dyn DelayMs<u16>) -> Result<AhtStatus, ()> {
+        delay.delay_ms(40_u16);
+        match self.i2c.write(ADDR, &[CMD_INIT, INIT_ARG1, INIT_ARG2]) {
+            Ok(_) => {
+                delay.delay_ms(75_u16);
+                let mut buffer = [0; 6];
+                match self.i2c.read(ADDR, &mut buffer) {
+                    Ok(_) => Ok(AhtStatus::from_byte(buffer[0])),
+                    Err(_) => Err(()),
+                }
+            }
+            Err(_) => Err(()),
+        }
+    }
+
+    pub fn measure(&mut self, delay: &mut dyn DelayMs<u16>) -> Result<[u8; 5], ()> {
+        match self
+            .i2c
+            .write(ADDR, &[CMD_MEASURE, MEASURE_ARG1, MEASURE_ARG2])
+        {
+            Ok(_) => {
+                delay.delay_ms(75_u16);
+                let mut buffer = [0; 6];
+                match self.i2c.read(ADDR, &mut buffer) {
+                    Ok(_) => {
+                        let status = AhtStatus::from_byte(buffer[0]);
+                        if status.busy {
+                            return Err(());
+                        }
+                        if !status.cal {
+                            return Err(());
+                        }
+                        Ok([buffer[1], buffer[2], buffer[3], buffer[4], buffer[5]])
+                    }
+                    Err(_e) => Err(()),
+                }
+            }
+            Err(_e) => Err(()),
+        }
+    }
+
+    pub fn free(self) -> I2C {
+        self.i2c
+    }
 }
